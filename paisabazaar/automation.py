@@ -13,7 +13,11 @@ from playwright.async_api import Browser, BrowserContext, Frame, Page, Playwrigh
 logger = logging.getLogger(__name__)
 
 CREDIT_SCORE_URL = "https://www.paisabazaar.com/cibil-credit-report/"
-OTP_FRAME_URL_PART = "accounts.paisabazaar.com/otp"
+ACCOUNTS_HOST = "accounts.paisabazaar.com"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+)
 
 
 @dataclass
@@ -33,16 +37,24 @@ class PaisabazaarAutomation:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._otp_frame: Frame | None = None
 
     async def start(self) -> None:
         if self._browser:
             return
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=self._headless)
+        self._browser = await self._playwright.chromium.launch(
+            headless=self._headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         self._context = await self._browser.new_context(
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1366, "height": 768},
             locale="en-IN",
             timezone_id="Asia/Kolkata",
+            user_agent=USER_AGENT,
+        )
+        await self._context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
         )
         self._page = await self._context.new_page()
 
@@ -57,6 +69,7 @@ class PaisabazaarAutomation:
             await self._playwright.stop()
             self._playwright = None
         self._page = None
+        self._otp_frame = None
 
     @property
     def page(self) -> Page:
@@ -68,30 +81,34 @@ class PaisabazaarAutomation:
         await self.page.evaluate(
             """() => {
               document
-                .querySelectorAll('[data-state="open"][aria-hidden="true"]')
+                .querySelectorAll(
+                  '[data-state="open"][aria-hidden="true"], .bg-black\\/60'
+                )
                 .forEach((el) => el.remove());
             }"""
         )
 
-    async def open_credit_score_page(self) -> None:
-        await self.page.goto(CREDIT_SCORE_URL, wait_until="domcontentloaded", timeout=60_000)
-        await self.page.wait_for_timeout(2_000)
+    async def _accept_terms(self) -> None:
+        try:
+            await self.page.locator('label:has-text("By logging in")').click(timeout=5_000)
+        except Exception:
+            pass
+        await self.page.evaluate(
+            """() => {
+              const label = [...document.querySelectorAll("label")].find((l) =>
+                l.innerText.includes("By logging in")
+              );
+              if (label) label.click();
+              const cb = document.querySelector('input[type="checkbox"]');
+              if (cb) {
+                cb.checked = true;
+                cb.dispatchEvent(new Event("change", { bubbles: true }));
+              }
+            }"""
+        )
+
+    async def _click_get_score(self) -> None:
         await self._clear_blocking_overlays()
-
-    async def submit_mobile_for_otp(self, mobile: str) -> str:
-        """Fill mobile on CIBIL page and trigger OTP. Returns status message."""
-        mobile = re.sub(r"\D", "", mobile)
-        if len(mobile) != 10 or mobile[0] not in "6789":
-            raise ValueError("Valid 10-digit Indian mobile number required (starts with 6–9).")
-
-        await self.open_credit_score_page()
-
-        terms = self.page.locator('label:has-text("By logging in")')
-        await terms.click(timeout=10_000)
-
-        await self.page.fill("#mobileNumber", mobile)
-        await self._clear_blocking_overlays()
-
         clicked = await self.page.evaluate(
             """() => {
               const btn = [...document.querySelectorAll("button")].find(
@@ -102,48 +119,140 @@ class PaisabazaarAutomation:
               return true;
             }"""
         )
-        if not clicked:
-            raise RuntimeError("Could not find 'Get Free Credit Score' button on page.")
+        if clicked:
+            return
+        btn = self.page.locator('button:has-text("Get Free Credit Score")').first
+        await self._clear_blocking_overlays()
+        await btn.click(force=True, timeout=15_000)
 
-        frame = await self._wait_for_otp_frame(timeout_sec=25)
+    async def _frame_has_otp_input(self, frame: Frame) -> bool:
+        try:
+            return await frame.locator("#ssoOtp, input[name='ssoOtp']").count() > 0
+        except Exception:
+            return False
+
+    async def _find_otp_frame(self) -> Frame | None:
+        if self._otp_frame and await self._frame_has_otp_input(self._otp_frame):
+            return self._otp_frame
+
+        for frame in self.page.frames:
+            if ACCOUNTS_HOST not in frame.url:
+                continue
+            if await self._frame_has_otp_input(frame):
+                self._otp_frame = frame
+                return frame
+            if "/otp" in frame.url or "auth_type=otp" in frame.url:
+                self._otp_frame = frame
+                return frame
+
+        for iframe in await self.page.locator(f'iframe[src*="{ACCOUNTS_HOST}"]').all():
+            frame = await iframe.content_frame()
+            if frame and (
+                await self._frame_has_otp_input(frame)
+                or "/otp" in frame.url
+                or "authorize" in frame.url
+            ):
+                self._otp_frame = frame
+                return frame
+        return None
+
+    async def _wait_for_otp_frame(self, timeout_sec: int = 60) -> Frame | None:
+        try:
+            await self.page.wait_for_selector(
+                f'iframe[src*="{ACCOUNTS_HOST}"]',
+                timeout=min(timeout_sec, 45) * 1000,
+            )
+        except Exception:
+            pass
+
+        deadline = asyncio.get_event_loop().time() + timeout_sec
+        while asyncio.get_event_loop().time() < deadline:
+            frame = await self._find_otp_frame()
+            if frame:
+                if not await self._frame_has_otp_input(frame):
+                    await asyncio.sleep(1)
+                    continue
+                return frame
+            await asyncio.sleep(0.5)
+        return None
+
+    async def open_credit_score_page(self) -> None:
+        await self.page.goto(CREDIT_SCORE_URL, wait_until="domcontentloaded", timeout=90_000)
+        await self.page.wait_for_timeout(3_000)
+        await self._clear_blocking_overlays()
+
+    async def _submit_mobile_once(self, mobile: str) -> Frame | None:
+        await self._accept_terms()
+        await self.page.fill("#mobileNumber", mobile)
+        await self.page.wait_for_timeout(500)
+        await self._click_get_score()
+        return await self._wait_for_otp_frame(timeout_sec=60)
+
+    async def submit_mobile_for_otp(self, mobile: str) -> str:
+        """Fill mobile on CIBIL page and trigger OTP. Returns status message."""
+        mobile = re.sub(r"\D", "", mobile)
+        if len(mobile) != 10 or mobile[0] not in "6789":
+            raise ValueError("Valid 10-digit Indian mobile number required (starts with 6–9).")
+
+        self._otp_frame = None
+        await self.open_credit_score_page()
+
+        frame = await self._submit_mobile_once(mobile)
+        if not frame:
+            logger.info("OTP frame not found, retrying after page reload …")
+            await self.open_credit_score_page()
+            frame = await self._submit_mobile_once(mobile)
+
         if not frame:
             shot = await self._screenshot("otp_frame_missing")
+            hint = await self._page_error_hint()
             raise RuntimeError(
-                "OTP screen did not load. Check mobile number or try again later."
+                "OTP screen load nahi hua. "
+                "Mobile Paisabazaar par registered hona chahiye. "
+                "VPS par `playwright install-deps chromium` chalao. "
+                f"{hint}"
                 + (f" Screenshot: {shot}" if shot else "")
             )
 
+        self._otp_frame = frame
         return (
             f"OTP sent to {mobile[:2]}******{mobile[-2:]}. "
             "Reply with the 4-digit OTP from your SMS."
         )
 
-    async def _wait_for_otp_frame(self, timeout_sec: int = 25) -> Frame | None:
-        deadline = asyncio.get_event_loop().time() + timeout_sec
-        while asyncio.get_event_loop().time() < deadline:
-            for frame in self.page.frames:
-                if OTP_FRAME_URL_PART in frame.url:
-                    return frame
-            await asyncio.sleep(0.5)
-        return None
+    async def _page_error_hint(self) -> str:
+        try:
+            for text in await self.page.locator(
+                '[role="alert"], .text-red-500, [class*="error"]'
+            ).all_inner_texts():
+                t = text.strip()
+                if t:
+                    return f"Site message: {t[:120]}"
+        except Exception:
+            pass
+        return ""
 
     async def submit_otp_and_fetch_score(self, otp: str, mobile: str) -> CreditScoreResult:
         otp = re.sub(r"\D", "", otp)
         if len(otp) != 4:
             raise ValueError("Paisabazaar OTP is 4 digits.")
 
-        frame = await self._wait_for_otp_frame(timeout_sec=10)
+        frame = self._otp_frame or await self._find_otp_frame()
+        if not frame:
+            frame = await self._wait_for_otp_frame(timeout_sec=15)
         if not frame:
             await self.submit_mobile_for_otp(mobile)
-            frame = await self._wait_for_otp_frame(timeout_sec=15)
+            frame = self._otp_frame
         if not frame:
             raise RuntimeError("OTP session expired. Send /cibil to start again.")
 
-        await frame.locator("#ssoOtp, input[name='ssoOtp']").fill(otp)
-        verify = frame.locator('button:has-text("Verify"), button:has-text("Login")').first
-        await verify.click()
+        await frame.locator("#ssoOtp, input[name='ssoOtp']").fill(otp, timeout=15_000)
+        verify = frame.locator(
+            'button:has-text("Verify"), button:has-text("Login")'
+        ).first
+        await verify.click(timeout=15_000)
 
-        await self.page.wait_for_timeout(8_000)
+        await self.page.wait_for_timeout(10_000)
         await self._clear_blocking_overlays()
 
         score = await self._extract_credit_score()
@@ -151,7 +260,7 @@ class PaisabazaarAutomation:
         message = (
             f"Your CIBIL / credit score: *{score}*"
             if score is not None
-            else "Logged in. Open dashboard on site if score is not visible in automation."
+            else "Logged in. Dashboard screenshot attached."
         )
         return CreditScoreResult(
             mobile=mobile,
