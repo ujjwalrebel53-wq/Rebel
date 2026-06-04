@@ -12,13 +12,19 @@ from playwright.async_api import Browser, BrowserContext, Frame, Page, Playwrigh
 
 logger = logging.getLogger(__name__)
 
-AUTOMATION_VERSION = "2.2"
+AUTOMATION_VERSION = "2.3"
 CREDIT_SCORE_URL = "https://www.paisabazaar.com/cibil-credit-report/"
 ACCOUNTS_HOST = "accounts.paisabazaar.com"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 )
+CHROMIUM_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+]
 
 
 @dataclass
@@ -40,14 +46,48 @@ class PaisabazaarAutomation:
         self._page: Page | None = None
         self._otp_ready: bool = False
 
-    async def start(self) -> None:
+    def _is_running(self) -> bool:
+        try:
+            if not self._browser or not self._browser.is_connected():
+                return False
+            if not self._page or self._page.is_closed():
+                return False
+            return True
+        except Exception:
+            return False
+
+    async def close(self) -> None:
+        self._otp_ready = False
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
         if self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._playwright:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+        self._page = None
+
+    async def ensure_started(self) -> None:
+        """Start browser or restart if it crashed / was closed (common on VPS)."""
+        if self._is_running():
             return
-        logger.info("Paisabazaar automation v%s", AUTOMATION_VERSION)
+        logger.info("Browser (re)starting — automation v%s", AUTOMATION_VERSION)
+        await self.close()
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=self._headless,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=CHROMIUM_ARGS,
         )
         self._context = await self._browser.new_context(
             viewport={"width": 1366, "height": 768},
@@ -60,29 +100,20 @@ class PaisabazaarAutomation:
         )
         self._page = await self._context.new_page()
 
-    async def close(self) -> None:
-        if self._context:
-            await self._context.close()
-            self._context = None
-        if self._browser:
-            await self._browser.close()
-            self._browser = None
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
-        self._page = None
-        self._otp_ready = False
+    async def start(self) -> None:
+        await self.ensure_started()
 
     @property
     def page(self) -> Page:
         if not self._page:
-            raise RuntimeError("Browser not started. Call start() first.")
+            raise RuntimeError("Browser not started. Call ensure_started() first.")
         return self._page
 
     def _accounts_frames(self) -> list[Frame]:
         return [f for f in self.page.frames if ACCOUNTS_HOST in f.url]
 
     async def _clear_blocking_overlays(self) -> None:
+        await self.ensure_started()
         await self.page.evaluate(
             """() => {
               document
@@ -132,6 +163,8 @@ class PaisabazaarAutomation:
         await btn.click(force=True, timeout=15_000)
 
     async def _otp_input_visible(self) -> bool:
+        if not self._is_running():
+            return False
         for frame in self._accounts_frames():
             try:
                 if await frame.locator("#ssoOtp, input[name='ssoOtp']").count() > 0:
@@ -143,13 +176,23 @@ class PaisabazaarAutomation:
     async def _wait_for_otp_frame(self, timeout_sec: int = 60) -> bool:
         deadline = asyncio.get_event_loop().time() + timeout_sec
         while asyncio.get_event_loop().time() < deadline:
+            if not self._is_running():
+                return False
             if await self._otp_input_visible():
                 return True
             await asyncio.sleep(0.5)
         return False
 
     async def open_credit_score_page(self) -> None:
-        await self.page.goto(CREDIT_SCORE_URL, wait_until="domcontentloaded", timeout=90_000)
+        await self.ensure_started()
+        try:
+            await self.page.goto(CREDIT_SCORE_URL, wait_until="domcontentloaded", timeout=90_000)
+        except Exception as exc:
+            if "closed" in str(exc).lower():
+                await self.ensure_started()
+                await self.page.goto(CREDIT_SCORE_URL, wait_until="domcontentloaded", timeout=90_000)
+            else:
+                raise
         await self.page.wait_for_timeout(3_000)
         await self._clear_blocking_overlays()
 
@@ -203,7 +246,6 @@ class PaisabazaarAutomation:
         return ""
 
     async def _fill_and_verify_otp(self, otp: str) -> None:
-        """Fill OTP using real Frame objects only (no FrameLocator / content_frame)."""
         for frame in self._accounts_frames():
             try:
                 inp = frame.locator("#ssoOtp, input[name='ssoOtp']")
@@ -227,12 +269,21 @@ class PaisabazaarAutomation:
         if len(otp) != 4:
             raise ValueError("Paisabazaar OTP is 4 digits.")
 
-        if not self._otp_ready and not await self._wait_for_otp_frame(timeout_sec=15):
+        await self.ensure_started()
+
+        if not await self._otp_input_visible():
+            if not self._otp_ready:
+                raise RuntimeError(
+                    "Browser band ho gaya. /cibil se dubara mobile + OTP bhejo."
+                )
+            logger.info("OTP screen missing, re-sending OTP request …")
             await self.submit_mobile_for_otp(mobile)
 
         if not await self._otp_input_visible():
             if not await self._wait_for_otp_frame(timeout_sec=20):
-                raise RuntimeError("OTP session expired. Send /cibil to start again.")
+                raise RuntimeError(
+                    "OTP expire ho gaya. /cibil se dubara start karo."
+                )
 
         await self._fill_and_verify_otp(otp)
 
@@ -276,6 +327,8 @@ class PaisabazaarAutomation:
 
     async def _screenshot(self, name: str) -> Path | None:
         try:
+            if not self._is_running():
+                return None
             path = self._artifacts_dir / f"{name}.png"
             await self.page.screenshot(path=str(path), full_page=True)
             return path

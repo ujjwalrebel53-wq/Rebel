@@ -43,14 +43,21 @@ async def _deny_if_not_allowed(update: Update) -> bool:
     return True
 
 
+async def _close_user_automation(context: ContextTypes.DEFAULT_TYPE) -> None:
+    auto = context.user_data.get("automation")
+    if auto:
+        await auto.close()
+        context.user_data.pop("automation", None)
+
+
 def _get_automation(context: ContextTypes.DEFAULT_TYPE) -> PaisabazaarAutomation:
-    bot_data = context.application.bot_data
-    if "automation" not in bot_data:
-        bot_data["automation"] = PaisabazaarAutomation(
+    if "automation" not in context.user_data:
+        bot_data = context.application.bot_data
+        context.user_data["automation"] = PaisabazaarAutomation(
             headless=bot_data.get("headless", True),
             artifacts_dir=bot_data.get("artifacts_dir"),
         )
-    return bot_data["automation"]
+    return context.user_data["automation"]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -71,6 +78,7 @@ async def cibil_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if await _deny_if_not_allowed(update):
         return ConversationHandler.END
     assert update.message
+    await _close_user_automation(context)
     context.user_data.clear()
     await update.message.reply_text(
         "10-digit mobile number bhejo (jo Paisabazaar / bank mein registered ho):",
@@ -93,10 +101,12 @@ async def receive_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     automation = _get_automation(context)
     try:
-        await automation.start()
+        await automation.ensure_started()
         status = await automation.submit_mobile_for_otp(mobile)
     except Exception as exc:
         logger.exception("submit_mobile failed")
+        await automation.close()
+        context.user_data.pop("automation", None)
         await update.message.reply_text(f"Error: {exc}")
         err_shot = Path("artifacts/otp_frame_missing.png")
         if err_shot.exists():
@@ -126,9 +136,12 @@ async def receive_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     automation = _get_automation(context)
     try:
+        await automation.ensure_started()
         result = await automation.submit_otp_and_fetch_score(otp, mobile)
     except Exception as exc:
         logger.exception("submit_otp failed")
+        await automation.close()
+        context.user_data.pop("automation", None)
         await update.message.reply_text(f"OTP fail: {exc}\n/cibil se dubara try karo.")
         return ConversationHandler.END
 
@@ -137,11 +150,14 @@ async def receive_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         with result.screenshot_path.open("rb") as photo:
             await update.message.reply_photo(photo=photo, caption="Dashboard screenshot")
 
+    await automation.close()
+    context.user_data.pop("automation", None)
     await update.message.reply_text("Done. /cibil for another check.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await _close_user_automation(context)
     context.user_data.clear()
     if update.message:
         await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
