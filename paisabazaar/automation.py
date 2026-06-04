@@ -81,10 +81,11 @@ class PaisabazaarAutomation:
         await self.page.evaluate(
             """() => {
               document
-                .querySelectorAll(
-                  '[data-state="open"][aria-hidden="true"], .bg-black\\/60'
-                )
+                .querySelectorAll('[data-state="open"][aria-hidden="true"]')
                 .forEach((el) => el.remove());
+              document.querySelectorAll('[class*="bg-black"]').forEach((el) => {
+                if (el.classList && el.classList.contains("fixed")) el.remove();
+              });
             }"""
         )
 
