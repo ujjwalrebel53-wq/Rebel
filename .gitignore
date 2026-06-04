@@ -7,3 +7,4 @@ playwright-report/
 test-results/
 artifacts/
 error.png
+bot/secrets.py

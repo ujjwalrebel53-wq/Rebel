@@ -1,4 +1,4 @@
-"""Environment configuration for the Telegram bot."""
+"""Configuration: .env, then optional gitignored secrets.py (see secrets.example.py)."""
 
 from __future__ import annotations
 
@@ -7,16 +7,36 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(_ROOT / ".env")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-HEADLESS = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes")
-ARTIFACTS_DIR = Path(os.getenv("ARTIFACTS_DIR", "artifacts"))
+# Gitignored file — copy secrets.example.py → secrets.py and paste your token there
+try:
+    from bot import secrets as _secrets  # type: ignore
+except ImportError:
+    _secrets = None
+
+
+def _from_secrets(name: str, default: str = "") -> str:
+    if _secrets is None:
+        return default
+    val = getattr(_secrets, name, default)
+    return str(val).strip() if val is not None else default
+
+
+def _env_or_secrets(name: str) -> str:
+    return os.getenv(name, "").strip() or _from_secrets(name)
+
+
+TELEGRAM_BOT_TOKEN = _env_or_secrets("TELEGRAM_BOT_TOKEN")
+HEADLESS = (
+    _env_or_secrets("HEADLESS") or "true"
+).lower() in ("1", "true", "yes")
+ARTIFACTS_DIR = Path(_env_or_secrets("ARTIFACTS_DIR") or "artifacts")
 
 
 def allowed_user_ids() -> set[int] | None:
-    """If TELEGRAM_ALLOWED_USER_IDS is set, only those users may use the bot."""
-    raw = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").strip()
+    raw = _env_or_secrets("TELEGRAM_ALLOWED_USER_IDS")
     if not raw:
         return None
     ids: set[int] = set()
