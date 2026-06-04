@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 CREDIT_SCORE_URL = "https://www.paisabazaar.com/cibil-credit-report/"
 ACCOUNTS_HOST = "accounts.paisabazaar.com"
+OTP_IFRAME = f'iframe[src*="{ACCOUNTS_HOST}"]'
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
@@ -37,7 +38,10 @@ class PaisabazaarAutomation:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
-        self._otp_frame: Frame | None = None
+        self._otp_ready: bool = False
+
+    def _otp_frame_locator(self):
+        return self.page.frame_locator(OTP_IFRAME)
 
     async def start(self) -> None:
         if self._browser:
@@ -69,7 +73,7 @@ class PaisabazaarAutomation:
             await self._playwright.stop()
             self._playwright = None
         self._page = None
-        self._otp_frame = None
+        self._otp_ready = False
 
     @property
     def page(self) -> Page:
@@ -126,63 +130,41 @@ class PaisabazaarAutomation:
         await self._clear_blocking_overlays()
         await btn.click(force=True, timeout=15_000)
 
+    async def _otp_input_visible(self) -> bool:
+        try:
+            fl = self._otp_frame_locator()
+            return await fl.locator("#ssoOtp, input[name='ssoOtp']").count() > 0
+        except Exception:
+            return False
+
     async def _frame_has_otp_input(self, frame: Frame) -> bool:
         try:
             return await frame.locator("#ssoOtp, input[name='ssoOtp']").count() > 0
         except Exception:
             return False
 
-    async def _find_otp_frame(self) -> Frame | None:
-        if self._otp_frame and await self._frame_has_otp_input(self._otp_frame):
-            return self._otp_frame
-
-        for frame in self.page.frames:
-            if ACCOUNTS_HOST not in frame.url:
-                continue
-            if await self._frame_has_otp_input(frame):
-                self._otp_frame = frame
-                return frame
-            if "/otp" in frame.url or "auth_type=otp" in frame.url:
-                self._otp_frame = frame
-                return frame
-
-        for iframe in await self.page.locator(f'iframe[src*="{ACCOUNTS_HOST}"]').all():
-            frame = await iframe.content_frame()
-            if frame and (
-                await self._frame_has_otp_input(frame)
-                or "/otp" in frame.url
-                or "authorize" in frame.url
-            ):
-                self._otp_frame = frame
-                return frame
-        return None
-
-    async def _wait_for_otp_frame(self, timeout_sec: int = 60) -> Frame | None:
+    async def _wait_for_otp_frame(self, timeout_sec: int = 60) -> bool:
         try:
-            await self.page.wait_for_selector(
-                f'iframe[src*="{ACCOUNTS_HOST}"]',
-                timeout=min(timeout_sec, 45) * 1000,
-            )
+            await self.page.wait_for_selector(OTP_IFRAME, timeout=min(timeout_sec, 45) * 1000)
         except Exception:
             pass
 
         deadline = asyncio.get_event_loop().time() + timeout_sec
         while asyncio.get_event_loop().time() < deadline:
-            frame = await self._find_otp_frame()
-            if frame:
-                if not await self._frame_has_otp_input(frame):
-                    await asyncio.sleep(1)
-                    continue
-                return frame
+            if await self._otp_input_visible():
+                return True
+            for frame in self.page.frames:
+                if ACCOUNTS_HOST in frame.url and await self._frame_has_otp_input(frame):
+                    return True
             await asyncio.sleep(0.5)
-        return None
+        return False
 
     async def open_credit_score_page(self) -> None:
         await self.page.goto(CREDIT_SCORE_URL, wait_until="domcontentloaded", timeout=90_000)
         await self.page.wait_for_timeout(3_000)
         await self._clear_blocking_overlays()
 
-    async def _submit_mobile_once(self, mobile: str) -> Frame | None:
+    async def _submit_mobile_once(self, mobile: str) -> bool:
         await self._accept_terms()
         await self.page.fill("#mobileNumber", mobile)
         await self.page.wait_for_timeout(500)
@@ -190,32 +172,30 @@ class PaisabazaarAutomation:
         return await self._wait_for_otp_frame(timeout_sec=60)
 
     async def submit_mobile_for_otp(self, mobile: str) -> str:
-        """Fill mobile on CIBIL page and trigger OTP. Returns status message."""
         mobile = re.sub(r"\D", "", mobile)
         if len(mobile) != 10 or mobile[0] not in "6789":
             raise ValueError("Valid 10-digit Indian mobile number required (starts with 6–9).")
 
-        self._otp_frame = None
+        self._otp_ready = False
         await self.open_credit_score_page()
 
-        frame = await self._submit_mobile_once(mobile)
-        if not frame:
+        ok = await self._submit_mobile_once(mobile)
+        if not ok:
             logger.info("OTP frame not found, retrying after page reload …")
             await self.open_credit_score_page()
-            frame = await self._submit_mobile_once(mobile)
+            ok = await self._submit_mobile_once(mobile)
 
-        if not frame:
+        if not ok:
             shot = await self._screenshot("otp_frame_missing")
             hint = await self._page_error_hint()
             raise RuntimeError(
                 "OTP screen load nahi hua. "
                 "Mobile Paisabazaar par registered hona chahiye. "
-                "VPS par `playwright install-deps chromium` chalao. "
                 f"{hint}"
                 + (f" Screenshot: {shot}" if shot else "")
             )
 
-        self._otp_frame = frame
+        self._otp_ready = True
         return (
             f"OTP sent to {mobile[:2]}******{mobile[-2:]}. "
             "Reply with the 4-digit OTP from your SMS."
@@ -238,17 +218,17 @@ class PaisabazaarAutomation:
         if len(otp) != 4:
             raise ValueError("Paisabazaar OTP is 4 digits.")
 
-        frame = self._otp_frame or await self._find_otp_frame()
-        if not frame:
-            frame = await self._wait_for_otp_frame(timeout_sec=15)
-        if not frame:
+        if not self._otp_ready and not await self._wait_for_otp_frame(timeout_sec=15):
             await self.submit_mobile_for_otp(mobile)
-            frame = self._otp_frame
-        if not frame:
-            raise RuntimeError("OTP session expired. Send /cibil to start again.")
 
-        await frame.locator("#ssoOtp, input[name='ssoOtp']").fill(otp, timeout=15_000)
-        verify = frame.locator(
+        if not await self._otp_input_visible():
+            if not await self._wait_for_otp_frame(timeout_sec=20):
+                raise RuntimeError("OTP session expired. Send /cibil to start again.")
+
+        fl = self._otp_frame_locator()
+        otp_input = fl.locator("#ssoOtp, input[name='ssoOtp']")
+        await otp_input.fill(otp, timeout=15_000)
+        verify = fl.locator(
             'button:has-text("Verify"), button:has-text("Login")'
         ).first
         await verify.click(timeout=15_000)
