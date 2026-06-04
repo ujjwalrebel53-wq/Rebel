@@ -12,9 +12,9 @@ from playwright.async_api import Browser, BrowserContext, Frame, Page, Playwrigh
 
 logger = logging.getLogger(__name__)
 
+AUTOMATION_VERSION = "2.2"
 CREDIT_SCORE_URL = "https://www.paisabazaar.com/cibil-credit-report/"
 ACCOUNTS_HOST = "accounts.paisabazaar.com"
-OTP_IFRAME = f'iframe[src*="{ACCOUNTS_HOST}"]'
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
@@ -40,12 +40,10 @@ class PaisabazaarAutomation:
         self._page: Page | None = None
         self._otp_ready: bool = False
 
-    def _otp_frame_locator(self):
-        return self.page.frame_locator(OTP_IFRAME)
-
     async def start(self) -> None:
         if self._browser:
             return
+        logger.info("Paisabazaar automation v%s", AUTOMATION_VERSION)
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=self._headless,
@@ -80,6 +78,9 @@ class PaisabazaarAutomation:
         if not self._page:
             raise RuntimeError("Browser not started. Call start() first.")
         return self._page
+
+    def _accounts_frames(self) -> list[Frame]:
+        return [f for f in self.page.frames if ACCOUNTS_HOST in f.url]
 
     async def _clear_blocking_overlays(self) -> None:
         await self.page.evaluate(
@@ -131,31 +132,19 @@ class PaisabazaarAutomation:
         await btn.click(force=True, timeout=15_000)
 
     async def _otp_input_visible(self) -> bool:
-        try:
-            fl = self._otp_frame_locator()
-            return await fl.locator("#ssoOtp, input[name='ssoOtp']").count() > 0
-        except Exception:
-            return False
-
-    async def _frame_has_otp_input(self, frame: Frame) -> bool:
-        try:
-            return await frame.locator("#ssoOtp, input[name='ssoOtp']").count() > 0
-        except Exception:
-            return False
+        for frame in self._accounts_frames():
+            try:
+                if await frame.locator("#ssoOtp, input[name='ssoOtp']").count() > 0:
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def _wait_for_otp_frame(self, timeout_sec: int = 60) -> bool:
-        try:
-            await self.page.wait_for_selector(OTP_IFRAME, timeout=min(timeout_sec, 45) * 1000)
-        except Exception:
-            pass
-
         deadline = asyncio.get_event_loop().time() + timeout_sec
         while asyncio.get_event_loop().time() < deadline:
             if await self._otp_input_visible():
                 return True
-            for frame in self.page.frames:
-                if ACCOUNTS_HOST in frame.url and await self._frame_has_otp_input(frame):
-                    return True
             await asyncio.sleep(0.5)
         return False
 
@@ -213,6 +202,26 @@ class PaisabazaarAutomation:
             pass
         return ""
 
+    async def _fill_and_verify_otp(self, otp: str) -> None:
+        """Fill OTP using real Frame objects only (no FrameLocator / content_frame)."""
+        for frame in self._accounts_frames():
+            try:
+                inp = frame.locator("#ssoOtp, input[name='ssoOtp']")
+                if await inp.count() == 0:
+                    continue
+                await inp.fill(otp, timeout=15_000)
+                btn = frame.locator(
+                    'button:has-text("Verify"), button:has-text("Login")'
+                ).first
+                await btn.click(timeout=15_000)
+                return
+            except Exception as exc:
+                logger.warning("OTP fill failed in frame %s: %s", frame.url[:60], exc)
+
+        raise RuntimeError(
+            "OTP box iframe mein nahi mila. /cibil se dubara try karo."
+        )
+
     async def submit_otp_and_fetch_score(self, otp: str, mobile: str) -> CreditScoreResult:
         otp = re.sub(r"\D", "", otp)
         if len(otp) != 4:
@@ -225,13 +234,7 @@ class PaisabazaarAutomation:
             if not await self._wait_for_otp_frame(timeout_sec=20):
                 raise RuntimeError("OTP session expired. Send /cibil to start again.")
 
-        fl = self._otp_frame_locator()
-        otp_input = fl.locator("#ssoOtp, input[name='ssoOtp']")
-        await otp_input.fill(otp, timeout=15_000)
-        verify = fl.locator(
-            'button:has-text("Verify"), button:has-text("Login")'
-        ).first
-        await verify.click(timeout=15_000)
+        await self._fill_and_verify_otp(otp)
 
         await self.page.wait_for_timeout(10_000)
         await self._clear_blocking_overlays()

@@ -10,6 +10,7 @@ from telegram.ext import Application
 
 from bot.config import ARTIFACTS_DIR, HEADLESS, TELEGRAM_BOT_TOKEN
 from bot.handlers import register_handlers
+from paisabazaar.automation import AUTOMATION_VERSION
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -33,7 +34,7 @@ def main() -> int:
 
     register_handlers(app)
 
-    logger.info("Bot started (headless=%s)", HEADLESS)
+    logger.info("Bot started v%s (headless=%s)", AUTOMATION_VERSION, HEADLESS)
     app.run_polling(allowed_updates=["message"])
     return 0
 
