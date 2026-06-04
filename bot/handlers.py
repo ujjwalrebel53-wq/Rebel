@@ -97,6 +97,12 @@ async def receive_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as exc:
         logger.exception("submit_mobile failed")
         await update.message.reply_text(f"Error: {exc}")
+        err_shot = Path("artifacts/otp_frame_missing.png")
+        if err_shot.exists():
+            with err_shot.open("rb") as photo:
+                await update.message.reply_photo(
+                    photo=photo, caption="Debug screenshot — site load issue"
+                )
         return ConversationHandler.END
 
     context.user_data["mobile"] = mobile
